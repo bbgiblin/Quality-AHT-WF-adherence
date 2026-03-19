@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 Workflow AHT Adherence Report
-Generates a per-DA/QA, per-week adherence report showing how many
+Generates a per-DA/QA (or per-Site), per-week adherence report showing how many
 workflow+locale combinations meet the expected AHT goal.
 
 Output format matches the manager template:
   DA Alias | Manager | Site | Wk.N (#audited, #>goal, #<=goal, adherence%) | ...
+  -- OR --
+  Site | Wk.N (#audited, #>goal, #<=goal, adherence%) | ...
 """
-
-from datetime import datetime
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # PAGE CONFIG
@@ -25,7 +26,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# COLUMN MAPPING & REGION DEFINITIONS
+# COLUMN MAPPING
 # ---------------------------------------------------------------------------
 
 COLUMN_MAPPING = {
@@ -42,6 +43,19 @@ COLUMN_MAPPING = {
     "Column-8:Customer": "customer",
 }
 
+REGION_MAPPING = {
+    "BOS": "AMER",
+    "SJO": "AMER",
+    "AMS": "EMEA",
+    "CBG": "EMEA",
+    "GDN": "EMEA",
+    "LHR": "EMEA",
+    "AMM": "APAJ",
+    "HYD": "APAJ",
+    "KIX": "APAJ",
+    "MAA": "APAJ",
+}
+
 
 # ---------------------------------------------------------------------------
 # DATA LOADING
@@ -54,13 +68,11 @@ def load_data(uploaded_file):
     df = df.rename(columns=COLUMN_MAPPING)
     df.columns = df.columns.str.strip()
 
-    # Clean string columns
     for col in ["site", "workflow", "locale"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
             df = df[df[col].notna() & (df[col] != "") & (df[col] != "nan")]
 
-    # Clean optional hierarchy columns
     for col in ["ops_manager", "team_manager", "da_name"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
@@ -68,13 +80,14 @@ def load_data(uploaded_file):
         else:
             df[col] = pd.NA
 
-    # Numerics
+    # Add region
+    df["region"] = df["site"].map(REGION_MAPPING).fillna("Unknown")
+
     df["aht"] = pd.to_numeric(df["aht"], errors="coerce")
     df["processed_units"] = pd.to_numeric(df["processed_units"], errors="coerce")
     df = df.dropna(subset=["aht", "processed_units"])
     df = df[(df["processed_units"] > 0) & (df["aht"] > 0)].copy()
 
-    # Parse week labels
     df["date_part"] = df["date_part"].astype(str)
     if df["date_part"].str.contains("Week", case=False).any():
         df["year"] = df["date_part"].str.extract(r"(\d{4})").astype(int)
@@ -130,23 +143,18 @@ def compute_network_expected_aht(df):
 # REPORT GENERATION
 # ---------------------------------------------------------------------------
 
-def generate_adherence_report(df, expected_aht_df, person_col, manager_col):
+def generate_adherence_report_person(df, expected_aht_df, person_col, manager_col):
     """
-    Generate the adherence report in the manager's requested format.
+    Generate the adherence report at the PERSON level.
 
     For each person+week, count:
       - # of workflow_locale combinations worked
       - # where person's AHT > expected AHT (not meeting goal)
       - # where person's AHT <= expected AHT (meeting goal)
       - Adherence rate = #meeting / #total
-
-    Returns a wide-format DataFrame matching the template.
     """
-    # Merge expected AHT onto the data
     merged = df.merge(expected_aht_df, on="workflow_locale", how="inner")
 
-    # Aggregate to person + workflow_locale + week level
-    # (a person may have multiple rows per workflow_locale per week if data is granular)
     person_wf_week = (
         merged.groupby([person_col, manager_col, "site", "workflow_locale", "week_label", "period_sort"])
         .agg(
@@ -157,10 +165,8 @@ def generate_adherence_report(df, expected_aht_df, person_col, manager_col):
         .reset_index()
     )
 
-    # Determine adherence per workflow_locale
     person_wf_week["meets_goal"] = person_wf_week["actual_aht"] <= person_wf_week["expected_aht"]
 
-    # Aggregate to person + week level
     person_week = (
         person_wf_week.groupby([person_col, manager_col, "site", "week_label", "period_sort"])
         .agg(
@@ -175,7 +181,6 @@ def generate_adherence_report(df, expected_aht_df, person_col, manager_col):
         person_week["num_at_or_below"] / person_week["num_wf_locale"]
     )
 
-    # Pivot to wide format: one row per person, columns grouped by week
     weeks_sorted = (
         person_week[["week_label", "period_sort"]]
         .drop_duplicates()
@@ -183,9 +188,12 @@ def generate_adherence_report(df, expected_aht_df, person_col, manager_col):
     )
     week_order = weeks_sorted["week_label"].tolist()
 
-    # Build the wide table
     rows = []
-    persons = person_week.groupby([person_col, manager_col, "site"]).size().reset_index()[[person_col, manager_col, "site"]]
+    persons = (
+        person_week.groupby([person_col, manager_col, "site"])
+        .size()
+        .reset_index()[[person_col, manager_col, "site"]]
+    )
 
     for _, person_row in persons.iterrows():
         row = {
@@ -217,32 +225,187 @@ def generate_adherence_report(df, expected_aht_df, person_col, manager_col):
         rows.append(row)
 
     report = pd.DataFrame(rows)
-
     return report, week_order
 
 
-def style_report(report_df, week_order):
-    """Apply formatting to the report for display."""
-    format_dict = {}
-    for wk in week_order:
-        adh_col = f"{wk}|Adherence%"
-        if adh_col in report_df.columns:
-            format_dict[adh_col] = "{:.0%}"
-
-    return report_df.style.format(format_dict, na_rep="—")
-
-
-def build_excel_report(report_df, week_order):
+def generate_adherence_report_site(df, expected_aht_df, include_region=True):
     """
-    Build a nicely formatted Excel file with merged header rows
-    matching the manager's template layout.
+    Generate the adherence report at the SITE level.
+
+    For each site+week, compute the site-level weighted AHT per workflow_locale,
+    then count:
+      - # of workflow_locale combinations at the site
+      - # where site AHT > expected AHT
+      - # where site AHT <= expected AHT
+      - Adherence rate
+    """
+    merged = df.merge(expected_aht_df, on="workflow_locale", how="inner")
+
+    # Aggregate to site + workflow_locale + week
+    site_wf_week = (
+        merged.groupby(["site", "region", "workflow_locale", "week_label", "period_sort"])
+        .agg(
+            actual_aht=("aht", lambda x: np.average(x, weights=merged.loc[x.index, "processed_units"])),
+            expected_aht=("expected_aht", "first"),
+            units=("processed_units", "sum"),
+            num_das=("da_name", "nunique"),
+        )
+        .reset_index()
+    )
+
+    site_wf_week["meets_goal"] = site_wf_week["actual_aht"] <= site_wf_week["expected_aht"]
+
+    # Aggregate to site + week
+    site_week = (
+        site_wf_week.groupby(["site", "region", "week_label", "period_sort"])
+        .agg(
+            num_wf_locale=("workflow_locale", "nunique"),
+            num_above_goal=("meets_goal", lambda x: (~x).sum()),
+            num_at_or_below=("meets_goal", "sum"),
+            total_units=("units", "sum"),
+            num_das=("num_das", "max"),
+        )
+        .reset_index()
+    )
+
+    site_week["adherence_rate"] = (
+        site_week["num_at_or_below"] / site_week["num_wf_locale"]
+    )
+
+    weeks_sorted = (
+        site_week[["week_label", "period_sort"]]
+        .drop_duplicates()
+        .sort_values("period_sort")
+    )
+    week_order = weeks_sorted["week_label"].tolist()
+
+    rows = []
+    sites = site_week[["site", "region"]].drop_duplicates().sort_values(["region", "site"])
+
+    for _, site_row in sites.iterrows():
+        row = {
+            "Site": site_row["site"],
+        }
+        if include_region:
+            row["Region"] = site_row["region"]
+
+        site_data = site_week[site_week["site"] == site_row["site"]]
+
+        for wk in week_order:
+            wk_data = site_data[site_data["week_label"] == wk]
+            if not wk_data.empty:
+                r = wk_data.iloc[0]
+                row[f"{wk}|#audited"] = int(r["num_wf_locale"])
+                row[f"{wk}|#AHT>WF AHT"] = int(r["num_above_goal"])
+                row[f"{wk}|#AHT<=WF AHT"] = int(r["num_at_or_below"])
+                row[f"{wk}|Adherence%"] = r["adherence_rate"]
+                row[f"{wk}|Units"] = int(r["total_units"])
+                row[f"{wk}|DAs"] = int(r["num_das"])
+            else:
+                row[f"{wk}|#audited"] = 0
+                row[f"{wk}|#AHT>WF AHT"] = 0
+                row[f"{wk}|#AHT<=WF AHT"] = 0
+                row[f"{wk}|Adherence%"] = np.nan
+                row[f"{wk}|Units"] = 0
+                row[f"{wk}|DAs"] = 0
+
+        rows.append(row)
+
+    report = pd.DataFrame(rows)
+    return report, week_order
+
+
+def generate_adherence_report_region(df, expected_aht_df):
+    """
+    Generate the adherence report at the REGION level.
+
+    For each region+week, compute the region-level weighted AHT per workflow_locale,
+    then count adherence.
+    """
+    merged = df.merge(expected_aht_df, on="workflow_locale", how="inner")
+
+    region_wf_week = (
+        merged.groupby(["region", "workflow_locale", "week_label", "period_sort"])
+        .agg(
+            actual_aht=("aht", lambda x: np.average(x, weights=merged.loc[x.index, "processed_units"])),
+            expected_aht=("expected_aht", "first"),
+            units=("processed_units", "sum"),
+            num_sites=("site", "nunique"),
+            num_das=("da_name", "nunique"),
+        )
+        .reset_index()
+    )
+
+    region_wf_week["meets_goal"] = region_wf_week["actual_aht"] <= region_wf_week["expected_aht"]
+
+    region_week = (
+        region_wf_week.groupby(["region", "week_label", "period_sort"])
+        .agg(
+            num_wf_locale=("workflow_locale", "nunique"),
+            num_above_goal=("meets_goal", lambda x: (~x).sum()),
+            num_at_or_below=("meets_goal", "sum"),
+            total_units=("units", "sum"),
+            num_sites=("num_sites", "max"),
+            num_das=("num_das", "max"),
+        )
+        .reset_index()
+    )
+
+    region_week["adherence_rate"] = (
+        region_week["num_at_or_below"] / region_week["num_wf_locale"]
+    )
+
+    weeks_sorted = (
+        region_week[["week_label", "period_sort"]]
+        .drop_duplicates()
+        .sort_values("period_sort")
+    )
+    week_order = weeks_sorted["week_label"].tolist()
+
+    rows = []
+    regions = sorted(region_week["region"].unique())
+
+    for region in regions:
+        row = {"Region": region}
+        region_data = region_week[region_week["region"] == region]
+
+        for wk in week_order:
+            wk_data = region_data[region_data["week_label"] == wk]
+            if not wk_data.empty:
+                r = wk_data.iloc[0]
+                row[f"{wk}|#audited"] = int(r["num_wf_locale"])
+                row[f"{wk}|#AHT>WF AHT"] = int(r["num_above_goal"])
+                row[f"{wk}|#AHT<=WF AHT"] = int(r["num_at_or_below"])
+                row[f"{wk}|Adherence%"] = r["adherence_rate"]
+                row[f"{wk}|Units"] = int(r["total_units"])
+                row[f"{wk}|Sites"] = int(r["num_sites"])
+            else:
+                row[f"{wk}|#audited"] = 0
+                row[f"{wk}|#AHT>WF AHT"] = 0
+                row[f"{wk}|#AHT<=WF AHT"] = 0
+                row[f"{wk}|Adherence%"] = np.nan
+                row[f"{wk}|Units"] = 0
+                row[f"{wk}|Sites"] = 0
+
+        rows.append(row)
+
+    report = pd.DataFrame(rows)
+    return report, week_order
+
+
+# ---------------------------------------------------------------------------
+# EXCEL EXPORT
+# ---------------------------------------------------------------------------
+
+def build_excel_report(report_df, week_order, fixed_cols, agg_mode):
+    """
+    Build a formatted Excel file with merged header rows.
     """
     from io import BytesIO
 
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        # We'll write manually for the merged headers
         workbook = writer.book
         worksheet = workbook.add_worksheet("AHT Adherence Report")
         writer.sheets["AHT Adherence Report"] = worksheet
@@ -275,14 +438,42 @@ def build_excel_report(report_df, week_order):
             "num_format": "0%", "align": "center", "border": 1,
             "bg_color": "#FFC7CE", "font_color": "#9C0006",
         })
+        yellow_pct_fmt = workbook.add_format({
+            "num_format": "0%", "align": "center", "border": 1,
+            "bg_color": "#FFEB9C", "font_color": "#9C6500",
+        })
 
-        # Fixed columns
-        fixed_cols = ["DA/QA Alias", "Manager", "Site"]
         n_fixed = len(fixed_cols)
 
-        # Row 0: merged week headers over the 4 sub-columns each
-        # Row 1: sub-column headers
-        # Row 2+: data
+        # Determine sub-headers based on aggregation mode
+        if agg_mode == "person":
+            sub_headers = [
+                "#of workflow_locale\ncombination audited",
+                "#with AHT\n>WF AHT",
+                "#with AHT\n<=WF AHT",
+                "Workflow AHT\nAdherence Rate",
+            ]
+            n_sub = 4
+        elif agg_mode == "site":
+            sub_headers = [
+                "#of workflow_locale\ncombination audited",
+                "#with AHT\n>WF AHT",
+                "#with AHT\n<=WF AHT",
+                "Workflow AHT\nAdherence Rate",
+                "Total\nUnits",
+                "# DAs",
+            ]
+            n_sub = 6
+        else:  # region
+            sub_headers = [
+                "#of workflow_locale\ncombination audited",
+                "#with AHT\n>WF AHT",
+                "#with AHT\n<=WF AHT",
+                "Workflow AHT\nAdherence Rate",
+                "Total\nUnits",
+                "# Sites",
+            ]
+            n_sub = 6
 
         # Write fixed column headers (merged across rows 0-1)
         for i, col_name in enumerate(fixed_cols):
@@ -290,28 +481,18 @@ def build_excel_report(report_df, week_order):
 
         # Write week group headers
         col_offset = n_fixed
-        sub_headers = [
-            "#of workflow_locale\ncombination audited",
-            "#of workflow_locale\ncombination with\nAHT >WF AHT",
-            "#of workflow_locale\ncombination with\nAHT <=WF AHT",
-            "Workflow AHT\nAdherence Rate",
-        ]
-
         for wk in week_order:
-            # Merge 4 columns for the week header
-            worksheet.merge_range(0, col_offset, 0, col_offset + 3, wk, header_fmt)
+            worksheet.merge_range(0, col_offset, 0, col_offset + n_sub - 1, wk, header_fmt)
             for j, sub in enumerate(sub_headers):
                 worksheet.write(1, col_offset + j, sub, subheader_fmt)
-            col_offset += 4
+            col_offset += n_sub
 
         # Write data rows
         for row_idx, (_, row) in enumerate(report_df.iterrows()):
-            data_row = row_idx + 2  # offset for 2 header rows
+            data_row = row_idx + 2
 
-            # Fixed columns
-            worksheet.write(data_row, 0, row.get("DA/QA Alias", ""), text_fmt)
-            worksheet.write(data_row, 1, row.get("Manager", ""), text_fmt)
-            worksheet.write(data_row, 2, row.get("Site", ""), text_fmt)
+            for i, col_name in enumerate(fixed_cols):
+                worksheet.write(data_row, i, row.get(col_name, ""), text_fmt)
 
             col_offset = n_fixed
             for wk in week_order:
@@ -330,19 +511,25 @@ def build_excel_report(report_df, week_order):
                     elif adherence < 0.6:
                         worksheet.write(data_row, col_offset + 3, adherence, red_pct_fmt)
                     else:
-                        worksheet.write(data_row, col_offset + 3, adherence, pct_fmt)
+                        worksheet.write(data_row, col_offset + 3, adherence, yellow_pct_fmt)
                 else:
                     worksheet.write(data_row, col_offset + 3, "—", num_fmt)
 
-                col_offset += 4
+                if n_sub > 4:
+                    if agg_mode == "site":
+                        worksheet.write(data_row, col_offset + 4, row.get(f"{wk}|Units", 0), num_fmt)
+                        worksheet.write(data_row, col_offset + 5, row.get(f"{wk}|DAs", 0), num_fmt)
+                    elif agg_mode == "region":
+                        worksheet.write(data_row, col_offset + 4, row.get(f"{wk}|Units", 0), num_fmt)
+                        worksheet.write(data_row, col_offset + 5, row.get(f"{wk}|Sites", 0), num_fmt)
+
+                col_offset += n_sub
 
         # Column widths
-        worksheet.set_column(0, 0, 18)  # Alias
-        worksheet.set_column(1, 1, 16)  # Manager
-        worksheet.set_column(2, 2, 10)  # Site
-        worksheet.set_column(n_fixed, n_fixed + len(week_order) * 4, 14)
+        for i in range(n_fixed):
+            worksheet.set_column(i, i, 18)
+        worksheet.set_column(n_fixed, n_fixed + len(week_order) * n_sub, 14)
 
-        # Row heights for headers
         worksheet.set_row(0, 25)
         worksheet.set_row(1, 50)
 
@@ -357,8 +544,8 @@ def build_excel_report(report_df, week_order):
 def main():
     st.title("📋 Workflow AHT Adherence Report")
     st.markdown(
-        "Generates a per-person, per-week report of how many workflow+locale "
-        "combinations meet the expected AHT goal."
+        "Generates a per-person, per-site, or per-region weekly report of how many "
+        "workflow+locale combinations meet the expected AHT goal."
     )
 
     # --- File uploads ---
@@ -389,16 +576,19 @@ def main():
     st.success(
         f"✅ Loaded {len(df):,} rows | "
         f"{df['period_sort'].nunique()} weeks | "
-        f"{df['workflow_locale'].nunique()} workflow+locale combos"
+        f"{df['workflow_locale'].nunique()} workflow+locale combos | "
+        f"{df['site'].nunique()} sites"
     )
 
-    # Load or compute expected AHT
     if expected_file:
         expected_aht_df = load_expected_aht(expected_file)
         st.success(f"✅ Loaded {len(expected_aht_df)} workflow AHT goals")
     else:
         expected_aht_df = compute_network_expected_aht(df)
-        st.info(f"ℹ️ No goals file uploaded — using network weighted mean AHT as baseline ({len(expected_aht_df)} workflow+locale combos)")
+        st.info(
+            f"ℹ️ No goals file — using network weighted mean AHT as baseline "
+            f"({len(expected_aht_df)} workflow+locale combos)"
+        )
 
     st.markdown("---")
 
@@ -408,41 +598,48 @@ def main():
     col_s1, col_s2, col_s3 = st.columns(3)
 
     with col_s1:
-        # Choose the person-level column
-        person_options = {}
-        if "da_name" in df.columns and df["da_name"].notna().any():
-            person_options["Data Associate (DA)"] = "da_name"
-        if "team_manager" in df.columns and df["team_manager"].notna().any():
-            person_options["Team Manager"] = "team_manager"
-        if "ops_manager" in df.columns and df["ops_manager"].notna().any():
-            person_options["Ops Manager"] = "ops_manager"
-
-        if not person_options:
-            st.error("No person-level columns found in data (DA, Team Manager, or Ops Manager).")
-            return
-
-        person_label = st.selectbox(
-            "Report by:",
-            options=list(person_options.keys()),
+        agg_mode = st.radio(
+            "Aggregation level:",
+            options=["👤 Person", "🏢 Site", "🌍 Region"],
+            horizontal=True,
+            help="Person: per-DA/QA. Site: all DAs at a site combined. Region: all sites in a region combined.",
         )
-        person_col = person_options[person_label]
 
-    with col_s2:
-        # Choose the manager column (one level up)
-        manager_options = {"(None)": None}
-        if "team_manager" in df.columns and df["team_manager"].notna().any() and person_col != "team_manager":
-            manager_options["Team Manager"] = "team_manager"
-        if "ops_manager" in df.columns and df["ops_manager"].notna().any() and person_col != "ops_manager":
-            manager_options["Ops Manager"] = "ops_manager"
+    # Person-level settings
+    person_col = None
+    manager_col_use = None
+    filter_persons = []
+    filter_sites = []
+    filter_regions = []
 
-        manager_label = st.selectbox(
-            "Manager column:",
-            options=list(manager_options.keys()),
-        )
-        manager_col = manager_options[manager_label]
+    if "Person" in agg_mode:
+        with col_s2:
+            person_options = {}
+            if "da_name" in df.columns and df["da_name"].notna().any():
+                person_options["Data Associate (DA)"] = "da_name"
+            if "team_manager" in df.columns and df["team_manager"].notna().any():
+                person_options["Team Manager"] = "team_manager"
+            if "ops_manager" in df.columns and df["ops_manager"].notna().any():
+                person_options["Ops Manager"] = "ops_manager"
 
-    with col_s3:
-        # Optional: filter to specific people
+            if not person_options:
+                st.error("No person-level columns found in data.")
+                return
+
+            person_label = st.selectbox("Report by:", options=list(person_options.keys()))
+            person_col = person_options[person_label]
+
+        with col_s3:
+            manager_options = {"(None)": None}
+            if "team_manager" in df.columns and df["team_manager"].notna().any() and person_col != "team_manager":
+                manager_options["Team Manager"] = "team_manager"
+            if "ops_manager" in df.columns and df["ops_manager"].notna().any() and person_col != "ops_manager":
+                manager_options["Ops Manager"] = "ops_manager"
+
+            manager_label = st.selectbox("Manager column:", options=list(manager_options.keys()))
+            manager_col = manager_options[manager_label]
+
+        # Person filter
         all_persons = sorted(
             [str(x) for x in df[person_col].dropna().unique() if str(x) not in ("nan", "")]
         )
@@ -452,6 +649,30 @@ def main():
             default=[],
             help="Leave empty to include everyone.",
         )
+
+    elif "Site" in agg_mode:
+        with col_s2:
+            all_sites = sorted(df["site"].unique())
+            filter_sites = st.multiselect(
+                "Filter to specific sites (optional):",
+                options=all_sites,
+                default=[],
+                help="Leave empty to include all sites.",
+            )
+        with col_s3:
+            st.empty()
+
+    else:  # Region
+        with col_s2:
+            all_regions = sorted(df["region"].unique())
+            filter_regions = st.multiselect(
+                "Filter to specific regions (optional):",
+                options=all_regions,
+                default=[],
+                help="Leave empty to include all regions.",
+            )
+        with col_s3:
+            st.empty()
 
     # Week filter
     all_weeks_sorted = (
@@ -478,75 +699,118 @@ def main():
     # --- Generate Report ---
     if st.button("📊 Generate Report", type="primary", use_container_width=True):
 
-        # Apply filters
-        df_report = df.copy()
+        df_report = df[df["week_label"].isin(selected_weeks)].copy()
 
-        # Filter to selected weeks
-        df_report = df_report[df_report["week_label"].isin(selected_weeks)]
+        if "Person" in agg_mode:
+            # Apply person filter
+            if filter_persons:
+                df_report = df_report[df_report[person_col].isin(filter_persons)]
+            df_report = df_report.dropna(subset=[person_col])
 
-        # Filter to selected persons
-        if filter_persons:
-            df_report = df_report[df_report[person_col].isin(filter_persons)]
+            if manager_col is None:
+                manager_col_use = "_manager_placeholder"
+                df_report[manager_col_use] = "—"
+            else:
+                manager_col_use = manager_col
+                df_report = df_report.dropna(subset=[manager_col_use])
 
-        # Drop rows without a person
-        df_report = df_report.dropna(subset=[person_col])
+            if df_report.empty:
+                st.error("No data after applying filters.")
+                return
 
-        # If no manager column, create a placeholder
-        if manager_col is None:
-            manager_col_use = "_manager_placeholder"
-            df_report[manager_col_use] = "—"
-        else:
-            manager_col_use = manager_col
-            df_report = df_report.dropna(subset=[manager_col_use])
+            with st.spinner("Generating report..."):
+                report_df, week_order = generate_adherence_report_person(
+                    df_report, expected_aht_df, person_col, manager_col_use
+                )
 
-        if df_report.empty:
-            st.error("No data after applying filters.")
-            return
+            fixed_cols = ["DA/QA Alias", "Manager", "Site"]
+            excel_agg_mode = "person"
 
-        with st.spinner("Generating report..."):
-            report_df, week_order = generate_adherence_report(
-                df_report, expected_aht_df, person_col, manager_col_use
-            )
+        elif "Site" in agg_mode:
+            if filter_sites:
+                df_report = df_report[df_report["site"].isin(filter_sites)]
+
+            if df_report.empty:
+                st.error("No data after applying filters.")
+                return
+
+            with st.spinner("Generating report..."):
+                report_df, week_order = generate_adherence_report_site(
+                    df_report, expected_aht_df, include_region=True
+                )
+
+            fixed_cols = ["Site", "Region"]
+            excel_agg_mode = "site"
+
+        else:  # Region
+            if filter_regions:
+                df_report = df_report[df_report["region"].isin(filter_regions)]
+
+            if df_report.empty:
+                st.error("No data after applying filters.")
+                return
+
+            with st.spinner("Generating report..."):
+                report_df, week_order = generate_adherence_report_region(
+                    df_report, expected_aht_df
+                )
+
+            fixed_cols = ["Region"]
+            excel_agg_mode = "region"
 
         if report_df.empty:
-            st.error("No matching data found. Check that your data and goals files have overlapping workflow+locale combinations.")
+            st.error(
+                "No matching data found. Check that your data and goals files "
+                "have overlapping workflow+locale combinations."
+            )
             return
 
-        # --- Display summary metrics ---
+        # --- Summary metrics ---
         st.markdown("### 📊 Report Results")
 
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
         with col_m1:
-            st.metric("People", report_df["DA/QA Alias"].nunique())
+            if "Person" in agg_mode:
+                st.metric("People", report_df["DA/QA Alias"].nunique())
+            elif "Site" in agg_mode:
+                st.metric("Sites", report_df["Site"].nunique())
+            else:
+                st.metric("Regions", report_df["Region"].nunique())
+
         with col_m2:
             st.metric("Weeks", len(week_order))
+
         with col_m3:
-            # Overall adherence
             adh_cols = [f"{wk}|Adherence%" for wk in week_order]
             overall_adh = report_df[adh_cols].mean().mean()
             st.metric("Avg Adherence", f"{overall_adh:.0%}")
+
         with col_m4:
             audited_cols = [f"{wk}|#audited" for wk in week_order]
             total_audited = report_df[audited_cols].sum().sum()
             st.metric("Total WF+Locale Audited", f"{int(total_audited):,}")
 
-        # --- Display the styled table ---
+        # --- Display table ---
         st.markdown("#### Adherence Table")
 
-        # For display, create a cleaner version with multi-level column headers
         display_df = report_df.copy()
 
-        # Rename columns for readability
         rename_map = {}
         for wk in week_order:
             rename_map[f"{wk}|#audited"] = f"{wk} | # Audited"
             rename_map[f"{wk}|#AHT>WF AHT"] = f"{wk} | # > Goal"
             rename_map[f"{wk}|#AHT<=WF AHT"] = f"{wk} | # ≤ Goal"
             rename_map[f"{wk}|Adherence%"] = f"{wk} | Adherence %"
+            if f"{wk}|Units" in display_df.columns:
+                rename_map[f"{wk}|Units"] = f"{wk} | Units"
+            if f"{wk}|DAs" in display_df.columns:
+                rename_map[f"{wk}|DAs"] = f"{wk} | # DAs"
+            if f"{wk}|Sites" in display_df.columns:
+                rename_map[f"{wk}|Sites"] = f"{wk} | # Sites"
 
         display_df = display_df.rename(columns=rename_map)
 
-        # Format adherence columns as percentages
         format_dict = {}
         for wk in week_order:
             col_name = f"{wk} | Adherence %"
@@ -555,7 +819,6 @@ def main():
 
         styled = display_df.style.format(format_dict, na_rep="—")
 
-        # Color adherence cells
         def color_adherence(val):
             if pd.isna(val):
                 return ""
@@ -568,7 +831,7 @@ def main():
                     return "background-color: #FFEB9C; color: #9C6500"
             return ""
 
-        adh_display_cols = [f"{wk} | Adherence %" for wk in week_order]
+        adh_display_cols = [f"{wk} | Adherence %" for wk in week_order if f"{wk} | Adherence %" in display_df.columns]
         styled = styled.map(color_adherence, subset=adh_display_cols)
 
         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -579,60 +842,78 @@ def main():
         col_d1, col_d2 = st.columns(2)
 
         with col_d1:
-            # CSV download
             csv_data = display_df.to_csv(index=False)
             st.download_button(
                 "💾 Download CSV",
                 csv_data,
-                f"aht_adherence_report_{datetime.now().strftime('%Y%m%d')}.csv",
+                f"aht_adherence_{excel_agg_mode}_{datetime.now().strftime('%Y%m%d')}.csv",
                 "text/csv",
                 use_container_width=True,
             )
 
         with col_d2:
-            # Excel download with formatted headers
-            excel_data = build_excel_report(report_df, week_order)
+            excel_data = build_excel_report(report_df, week_order, fixed_cols, excel_agg_mode)
             st.download_button(
                 "📊 Download Excel (Formatted)",
                 excel_data,
-                f"aht_adherence_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                f"aht_adherence_{excel_agg_mode}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.ml.sheet",
                 use_container_width=True,
             )
 
-        # --- Optional: Drill-down detail ---
+        # --- Drill-down ---
         with st.expander("🔍 Drill-down: Workflow-level detail", expanded=False):
-            st.markdown("See which specific workflow+locale combinations each person is above/below goal on.")
 
-            drill_person = st.selectbox(
-                "Select person:",
-                options=sorted(report_df["DA/QA Alias"].unique()),
-                key="drill_person",
-            )
+            if "Person" in agg_mode:
+                drill_entity = st.selectbox(
+                    "Select person:",
+                    options=sorted(report_df["DA/QA Alias"].unique()),
+                    key="drill_entity",
+                )
+                drill_filter_col = person_col
+                drill_filter_val = drill_entity
+            elif "Site" in agg_mode:
+                drill_entity = st.selectbox(
+                    "Select site:",
+                    options=sorted(report_df["Site"].unique()),
+                    key="drill_entity",
+                )
+                drill_filter_col = "site"
+                drill_filter_val = drill_entity
+            else:
+                drill_entity = st.selectbox(
+                    "Select region:",
+                    options=sorted(report_df["Region"].unique()),
+                    key="drill_entity",
+                )
+                drill_filter_col = "region"
+                drill_filter_val = drill_entity
+
             drill_week = st.selectbox(
                 "Select week:",
                 options=week_order,
                 key="drill_week",
             )
 
-            # Rebuild the detail for this person+week
             df_drill = df_report[
-                (df_report[person_col] == drill_person)
+                (df_report[drill_filter_col] == drill_filter_val)
                 & (df_report["week_label"] == drill_week)
             ]
 
             if df_drill.empty:
-                st.info("No data for this person+week combination.")
+                st.info("No data for this selection.")
             else:
                 merged_drill = df_drill.merge(expected_aht_df, on="workflow_locale", how="inner")
 
                 if merged_drill.empty:
-                    st.info("No matching workflow goals for this person's workflows.")
+                    st.info("No matching workflow goals for this selection's workflows.")
                 else:
                     detail = (
                         merged_drill.groupby("workflow_locale")
                         .agg(
-                            actual_aht=("aht", lambda x: np.average(x, weights=merged_drill.loc[x.index, "processed_units"])),
+                            actual_aht=("aht", lambda x: np.average(
+                                x, weights=merged_drill.loc[x.index, "processed_units"]
+                            )),
                             expected_aht=("expected_aht", "first"),
                             units=("processed_units", "sum"),
                         )
@@ -640,12 +921,17 @@ def main():
                     )
                     detail["meets_goal"] = detail["actual_aht"] <= detail["expected_aht"]
                     detail["difference"] = detail["actual_aht"] - detail["expected_aht"]
-                    detail["status"] = detail["meets_goal"].map({True: "✅ ≤ Goal", False: "❌ > Goal"})
+                    detail["status"] = detail["meets_goal"].map(
+                        {True: "✅ ≤ Goal", False: "❌ > Goal"}
+                    )
 
                     detail = detail.sort_values("meets_goal")
 
                     st.dataframe(
-                        detail[["workflow_locale", "actual_aht", "expected_aht", "difference", "units", "status"]]
+                        detail[
+                            ["workflow_locale", "actual_aht", "expected_aht",
+                             "difference", "units", "status"]
+                        ]
                         .rename(columns={
                             "workflow_locale": "Workflow | Locale",
                             "actual_aht": "Actual AHT (s)",
